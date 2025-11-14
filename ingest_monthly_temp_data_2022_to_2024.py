@@ -1,156 +1,134 @@
-# ===== Ingest NOAA CDO CGSM monthly CSV into MySQL =====
+# ===== PYTHON QUERY TO IMPORT CDO MONTHLY TEMPERATURE DATA INTO MYSQL ===== #
+
 import math
 import pandas as pd
 import numpy as np
 import mysql.connector
 from mysql.connector import errorcode
 from pathlib import Path
-from config import DB_CONFIG  # {host, port, user, password, database}
+from config import DB_CONFIG  # expects host, user, password, database
 
-# --- user settings ---
+# ==== USER SETTINGS ====
 CSV_PATH = Path(__file__).resolve().parent.parent / "data" / "monthly_temp_data_2022_to_2024.csv"
-TABLE = "cdo_cgsm_monthly"
-BATCH_SIZE = 5000
-FILE_NAME = CSV_PATH.name
-# ---------------------
+TABLE = "weather_monthly"
+BATCH_SIZE = 10000
+FILE_NAME_FOR_PROVENANCE = CSV_PATH.name
+# ========================
 
-# expected headers (case-insensitive)
-REQUIRED = ["station", "name", "date", "cdsd", "emnt", "emxt", "hdsd", "tavg", "tmax", "tmin"]
-
-# normalize columns
-def norm_cols(cols):
-    return [c.strip().lower().replace(" ", "_") for c in cols]
-
-def to_float(x):
+# Fahrenheit → Celsius conversion
+def f_to_c(f):
+    if f is None or pd.isna(f):
+        return None
     try:
-        if pd.isna(x): return None
-        s = str(x).strip()
-        if s == "": return None
-        return float(s)
-    except Exception:
+        return (float(f) - 32) * 5/9
+    except:
         return None
 
-def to_month_start(val):
-    # input like '2023-07' or '2023-7'
-    if pd.isna(val): return None
-    s = str(val).strip()
-    if len(s) == 7 and s[4] == "-":
-        y, m = s.split("-")
-    else:
-        parts = s.split("-")
-        if len(parts) < 2: return None
-        y, m = parts[0], parts[1]
-    try:
-        y = int(y); m = int(m)
-        return f"{y:04d}-{m:02d}-01"
-    except Exception:
-        return None
+# Clean column headers
+def normalize_headers(cols):
+    out = []
+    for col in cols:
+        col = col.strip().lower().replace(" ", "_")
+        out.append(col)
+    return out
 
 def main():
     if not CSV_PATH.exists():
         raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
 
-    # read as strings; let us control conversion
-    df = pd.read_csv(CSV_PATH, dtype=str, keep_default_na=True)
-    df.columns = norm_cols(df.columns)
+    # Load CSV
+    df = pd.read_csv(CSV_PATH, dtype=str)
+    df.columns = normalize_headers(df.columns)
 
-    # check headers
-    missing = [c for c in REQUIRED if c not in df.columns]
-    if missing:
-        raise ValueError(f"CSV missing columns: {missing}. Found: {list(df.columns)}")
+    print("Raw columns:", list(df.columns))
 
-    # derive month_start and clean numerics
-    df["month_start"] = df["date"].map(to_month_start)
-    for col in ["cdsd", "hdsd", "emnt", "emxt", "tavg", "tmax", "tmin"]:
-        df[col] = df[col].map(to_float)
+    # Clean DATE into MySQL DATE (YYYY-MM-01)
+    df["date_month"] = (
+        df["date"]
+        .str.strip()
+        .apply(lambda x: f"{x}-01" if pd.notna(x) else None)
+    )
 
-    # trim text
-    for col in ["station", "name"]:
-        df[col] = df[col].astype(str).str.strip()
+    # Numeric conversions
+    numeric_cols = ["cdsd", "emnt", "emxt", "hdsd", "tavg", "tmax", "tmin"]
+    for col in numeric_cols:
+        df[col] = df[col].apply(lambda x: float(x) if pd.notna(x) and x != "" else None)
 
-    # provenance
-    df["file_name"] = FILE_NAME
+    # Celsius conversions
+    df["tavg_c"] = df["tavg"].apply(f_to_c)
+    df["tmax_c"] = df["tmax"].apply(f_to_c)
+    df["tmin_c"] = df["tmin"].apply(f_to_c)
 
-    # keep only the insert columns in order
-    insert_cols = [
-        "station", "name", "month_start",
-        "cdsd", "hdsd", "emxt", "emnt", "tavg", "tmax", "tmin",
+    # Add provenance
+    df["file_name"] = FILE_NAME_FOR_PROVENANCE
+
+    # Define insert order
+    INSERT_COLUMNS = [
+        "station_id", "station_name", "date_month",
+        "cdsd", "emnt", "emxt", "hdsd",
+        "tavg", "tmax", "tmin",
+        "tavg_c", "tmax_c", "tmin_c",
         "file_name"
     ]
-    df = df[insert_cols]
 
-    # drop rows without a station or month_start
-    before = len(df)
-    df = df[ df["station"].ne("").fillna(False) & df["month_start"].notna() ]
-    after = len(df)
-    if after < before:
-        print(f"Dropped {before - after} rows missing station/month_start.")
+    # Reorder df
+    df = df.rename(columns={
+        "station": "station_id",
+        "name": "station_name"
+    })
 
-    # convert NaN -> None for MySQL
-    records = df.astype(object).where(pd.notnull(df), None).values.tolist()
+    df = df[INSERT_COLUMNS]
+
+    # Replace NaN with None
+    df = df.replace({np.nan: None})
+
+    records = df.values.tolist()
     total = len(records)
-    print(f"Prepared {total:,} rows from {FILE_NAME}")
+    print(f"Prepared {total:,} rows for insertion.")
 
-    placeholders = ", ".join(["%s"] * len(insert_cols))
-    col_list = ", ".join(f"`{c}`" for c in insert_cols)
+    # Build insert SQL
+    placeholders = ", ".join(["%s"] * len(INSERT_COLUMNS))
+    col_list = ", ".join(f"`{c}`" for c in INSERT_COLUMNS)
+    insert_sql = f"INSERT INTO {TABLE} ({col_list}) VALUES ({placeholders})"
 
-    # UPSERT to avoid duplicates on (station, month_start)
-    update_clause = ", ".join(
-        f"`{c}`=VALUES(`{c}`)" for c in
-        ["name", "cdsd", "hdsd", "emxt", "emnt", "tavg", "tmax", "tmin", "file_name"]
-    )
-    insert_sql = (
-        f"INSERT INTO {TABLE} ({col_list}) VALUES ({placeholders}) "
-        f"ON DUPLICATE KEY UPDATE {update_clause}"
-    )
-
+    # Insert into MySQL
     try:
-        cnx = mysql.connector.connect(**DB_CONFIG, autocommit=False)
+        cnx = mysql.connector.connect(
+            host=DB_CONFIG["host"],
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            database=DB_CONFIG["database"],
+            autocommit=False
+        )
         cur = cnx.cursor()
 
-        if total == 0:
-            print("Nothing to insert.")
-        else:
-            batches = math.ceil(total / BATCH_SIZE)
-            for b in range(batches):
-                start = b * BATCH_SIZE
-                end = min((b + 1) * BATCH_SIZE, total)
-                batch = records[start:end]
-                print(f"Inserting rows {start}..{end-1} ({len(batch)})")
-                try:
-                    cur.executemany(insert_sql, batch)
-                    cnx.commit()
-                except Exception as e:
-                    cnx.rollback()
-                    print(f"Batch {b+1}/{batches} failed: {e}")
-                    raise
+        batches = math.ceil(total / BATCH_SIZE)
+        for b in range(batches):
+            start = b * BATCH_SIZE
+            end = min(start + BATCH_SIZE, total)
+            batch = records[start:end]
+            print(f"Inserting rows {start}..{end-1} ({len(batch)} rows)")
+            try:
+                cur.executemany(insert_sql, batch)
+                cnx.commit()
+            except Exception as e:
+                cnx.rollback()
+                print(f"Batch {b+1}/{batches} failed ({start}-{end-1}): {e}")
+                raise
 
-        # quick check
         cur.execute(f"SELECT COUNT(*) FROM {TABLE}")
-        (n_rows,) = cur.fetchone()
-        print(f"✅ {TABLE} now has {n_rows:,} rows.")
-
-        cur.execute(
-            f"""SELECT station, MIN(month_start), MAX(month_start)
-                  FROM {TABLE}
-              GROUP BY station"""
-        )
-        for row in cur.fetchall():
-            print("Coverage:", row)
+        (count,) = cur.fetchone()
+        print(f"✅ Table {TABLE} now has {count:,} rows.")
 
     except mysql.connector.Error as err:
-        if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
-            print("Access denied.")
-        elif err.errno == errorcode.ER_BAD_DB_ERROR:
-            print("Database does not exist.")
-        else:
-            print(f"MySQL error: {err}")
+        print("MySQL error:", err)
         raise
     finally:
         try: cur.close()
         except: pass
         try: cnx.close()
         except: pass
+
 
 if __name__ == "__main__":
     main()
