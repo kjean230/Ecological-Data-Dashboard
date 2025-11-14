@@ -162,7 +162,7 @@ def main():
 
                 start = end
 
-        print("\n✅ All CSVs imported successfully.")
+        print("\n All CSVs imported successfully.")
 
     except mysql.connector.Error as err:
         print("MySQL error:", err)
